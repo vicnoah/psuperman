@@ -1,107 +1,99 @@
 package main
 
 import (
-    "flag"
-    "fmt"
-    "log"
-    "net"
-    "os"
-    "os/exec"
+	"flag"
+	"fmt"
+	"log"
+	"net"
 
-    "github.com/songgao/water"
-    "golang.org/x/net/ipv4"
+	"github.com/wuwengang/psuperman/core/parser"
+
+	"github.com/wuwengang/psuperman/core/packet"
+
+	"github.com/wuwengang/psuperman/core/listen"
+
+	"golang.org/x/net/ipv4"
 )
 
 const (
-    // I use TUN interface, so only plain IP packet, no ethernet header + mtu is set to 1300
-    BUFFERSIZE = 1500
-    MTU        = "1300"
+	// I use TUN interface, so only plain IP packet, no ethernet header + mtu is set to 1300
+	BUFFERSIZE = 1500
+	MTU        = "1300"
 )
 
 var (
-    localIP  = flag.String("local", "", "Local tun interface IP/MASK like 192.168.3.3⁄24")
-    remoteIP = flag.String("remote", "", "Remote server (external) IP like 8.8.8.8")
-    port     = flag.Int("port", 4321, "UDP port for communication")
+	localIP  = flag.String("local", "", "Local tun interface IP/MASK like 192.168.3.3⁄24")
+	remoteIP = flag.String("remote", "", "Remote server (external) IP like 8.8.8.8")
+	port     = flag.Int("port", 4321, "UDP port for communication")
+	tun      = &listen.Tun{}
+	local    = &listen.Udp{}
+	prs      = &parser.Parser{}
 )
 
-func runIP(args ...string) {
-    cmd := exec.Command("/sbin/ip", args...)
-    cmd.Stderr = os.Stderr
-    cmd.Stdout = os.Stdout
-    cmd.Stdin = os.Stdin
-    err := cmd.Run()
-    if nil != err {
-        log.Fatalln("Error running /sbin/ip:", err)
-    }
-}
-
 func main() {
-    flag.Parse()
-    // check if we have anything
-    if "" == *localIP {
-        flag.Usage()
-        log.Fatalln("\nlocal ip is not specified")
-    }
-    if "" == *remoteIP {
-        flag.Usage()
-        log.Fatalln("\nremote server is not specified")
-    }
-    config := water.Config{
-        DeviceType: water.TUN,
-    }
-    config.Name = "O_O"
+	flag.Parse()
+	// check if we have anything
+	if "" == *localIP {
+		flag.Usage()
+		log.Fatalln("\nlocal ip is not specified")
+	}
+	if "" == *remoteIP {
+		flag.Usage()
+		log.Fatalln("\nremote server is not specified")
+	}
+	err := tun.Listen(*localIP, MTU, BUFFERSIZE)
+	fmt.Println(err)
 
-    iface, err := water.New(config)
-    if err != nil {
-        log.Fatal(err)
-    }
-    log.Println("Interface allocated:", iface.Name())
-    // set interface parameters
-    runIP("link", "set", "dev", iface.Name(), "mtu", MTU)
-    runIP("addr", "add", *localIP, "dev", iface.Name())
-    runIP("link", "set", "dev", iface.Name(), "up")
-    // reslove remote addr
-    remoteAddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%v", *remoteIP, *port))
-    if nil != err {
-        log.Fatalln("Unable to resolve remote addr:", err)
-    }
-    // listen to local socket
-    lstnAddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf(":%v", *port))
-    if nil != err {
-        log.Fatalln("Unable to get UDP socket:", err)
-    }
-    lstnConn, err := net.ListenUDP("udp", lstnAddr)
-    if nil != err {
-        log.Fatalln("Unable to listen on UDP socket:", err)
-    }
-    defer lstnConn.Close()
-    // recv in separate thread
-    go func() {
-        buf := make([]byte, BUFFERSIZE)
-        for {
-            n, addr, err := lstnConn.ReadFromUDP(buf)
-            // just debug
-            header, _ := ipv4.ParseHeader(buf[:n])
-            fmt.Printf("Received %d bytes from %v: %+v\n", n, addr, header)
-            if err != nil || n == 0 {
-                fmt.Println("Error: ", err)
-                continue
-            }
-            // write to TUN interface
-            iface.Write(buf[:n])
-        }
-    }()
-    // and one more loop
-    packet := make([]byte, BUFFERSIZE)
-    for {
-        plen, err := iface.Read(packet)
-        if err != nil {
-            break
-        }
-        // debug :)
-        header, _ := ipv4.ParseHeader(packet[:plen])
-        fmt.Printf("Sending to remote: %+v (%+v)\n", header, err)
-        // real send
-        lstnConn.WriteToUDP(packet[:plen], remoteAddr)
-    }
+	err = local.Listen(fmt.Sprintf(":%v", *port), BUFFERSIZE)
+	fmt.Println(err)
+
+	defer func() {
+		_ = local.Close()
+	}()
+
+	// recv udp packet to tun
+	go func() {
+		for {
+			n, addr, payload, err := local.Read()
+			// just debug
+			header, _ := ipv4.ParseHeader(payload)
+			fmt.Printf("Received %d bytes from %v: %+v\n", n, addr, header)
+			prs.SetHeader(*header)
+			lan := prs.IsLan()
+			if lan {
+				fmt.Println("局域网ip")
+			} else {
+				fmt.Println("广域网ip")
+			}
+			protocol, err := packet.Ipv4Packet{}.Protocol(header.Protocol)
+			if err != nil {
+				fmt.Println(err)
+			} else {
+				fmt.Println(protocol)
+			}
+			if err != nil || n == 0 {
+				fmt.Println("Error: ", err)
+				continue
+			}
+			// write to TUN interface
+			_, _ = tun.Write(payload)
+		}
+	}()
+
+	// recv tun packet to udp
+	for {
+		plen, packet, err := tun.Read()
+		if err != nil {
+			break
+		}
+		// debug :)
+		header, _ := ipv4.ParseHeader(packet[:plen])
+		fmt.Printf("Sending to remote: %+v (%+v)\n", header, err)
+		// real send
+		addr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%v", *remoteIP, *port))
+		if err != nil {
+			return
+		}
+		_, _ = local.Write(packet, addr)
+	}
 }
